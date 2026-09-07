@@ -25,11 +25,12 @@ from html import escape as html_escape
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatType, ParseMode
 from aiogram.exceptions import (
     TelegramBadRequest,
+    TelegramConflictError,
     TelegramForbiddenError,
     TelegramRetryAfter,
 )
@@ -105,6 +106,8 @@ class ChatRow:
     buttons: str = "[]"     # JSON list of button rows
     emoji: str = "[]"       # JSON list of {"id": custom_emoji_id, "char": emoji char}
     approve: int = 0        # 0 = message WITHOUT approving (default); 1 = auto-approve
+    custom_bot_token: str = ""   # Channel-Help jaisa custom bot (welcome isi se jayega)
+    custom_bot_name: str = ""    # custom bot ka @username (display ke liye)
     created_at: int = 0
 
     def button_rows(self) -> list:
@@ -181,12 +184,33 @@ class Database:
                 self._client = MongoClient(self.uri, serverSelectionTimeoutMS=8000)
                 self._client.admin.command("ping")
             except Exception as e:
+                emsg = str(e)
+                err = emsg.lower()
+                hint = ""
+                if "escape" in err or "rfc 3986" in err or "invalid" in err:
+                    hint = ("\n   ⚡ PROBLEM: MONGO_URI ka format hi galat hai!\n"
+                            "      • '<db_username>' jaisa placeholder mat chhodo — uski jagah\n"
+                            "        apna ASLI username daalo (Atlas → Database Access me dikhta hai)\n"
+                            "      • URI me [brackets] / (mailto:) / <> jaise characters nahi\n"
+                            "        hone chahiye — sirf ye format:\n"
+                            "        mongodb+srv://USERNAME:PASSWORD@cluster0.xxxx.mongodb.net/?appName=Cluster0")
+                elif "authentication failed" in err or "bad auth" in err:
+                    hint = ("\n   ⚡ PROBLEM: USERNAME ya PASSWORD galat hai!\n"
+                            "      • cloud.mongodb.com → 'Database Access' → apna username dekho\n"
+                            "      • Password bhool gaye ho to: Database Access → Edit →\n"
+                            "        'Edit Password' → naya banao\n"
+                            "      • Phir URI me daalo:  mongodb+srv://ASLI-USERNAME:NAYA-PASSWORD@cluster0...")
+                elif "timed out" in err or "select" in err or "dns" in err:
+                    hint = ("\n   ⚡ PROBLEM: Cluster tak network nahi pahunch raha!\n"
+                            "      • Atlas → 'Network Access' → 'Add IP Address' →\n"
+                            "        0.0.0.0/0 (Allow from anywhere) daalo — zaroori hai!\n"
+                            "      • Cluster 'M0' hokar PAUSED to nahi? (Atlas dashboard check karo)")
                 raise SystemExit(
-                    f"❌ MongoDB se connection nahi ho paya: {e}\n"
-                    f"   • .env me MONGO_URI check karo (local: mongodb://localhost:27017, "
-                    f"Atlas: mongodb+srv://...)\n"
-                    f"   • VPS par: sudo systemctl start mongod (ya docker run -d -p 27017:27017 mongo)\n"
-                    f"   • Pip: pip install -r requirements.txt")
+                    f"❌❌ MongoDB se connection nahi ho paya — isliye bot start nahi hua! ❌❌\n\n"
+                    f"   Error: {emsg[:200]}{hint}\n\n"
+                    "   Atlas free banana: cloud.mongodb.com → Build a Database → M0 (FREE)\n"
+                    "   Local install: sudo apt install -y mongodb-org && sudo systemctl enable --now mongod\n"
+                    "   Packages: pip install -r requirements.txt")
         self._db = self._client[self.db_name]
 
         # unique indexes (multi-user data isolation ke liye)
@@ -234,6 +258,26 @@ class Database:
         except Exception as e:
             log.warning("SQLite migration failed: %s", e)
 
+    # ── admins (authorized bot users) ──────────────────────────────────────
+    @property
+    def admins(self): return self._db["admins"]
+
+    def is_admin(self, user_id: int) -> bool:
+        return self.admins.find_one({"user_id": user_id}) is not None
+
+    def add_admin(self, user_id: int, added_by: int):
+        self.admins.update_one(
+            {"user_id": user_id},
+            {"$setOnInsert": {"user_id": user_id, "added_by": added_by,
+                              "added_at": int(time.time())}},
+            upsert=True)
+
+    def remove_admin(self, user_id: int):
+        self.admins.delete_one({"user_id": user_id})
+
+    def get_admins(self) -> list:
+        return list(self.admins.find().sort("added_at", 1))
+
     # ── chats ───────────────────────────────────────────────────────────────
     def _doc_to_chat(self, d) -> ChatRow:
         return ChatRow(
@@ -247,6 +291,8 @@ class Database:
             buttons=d.get("buttons", "[]"),
             emoji=d.get("emoji", "[]"),
             approve=d.get("approve", 0),
+            custom_bot_token=d.get("custom_bot_token", ""),
+            custom_bot_name=d.get("custom_bot_name", ""),
             created_at=d.get("created_at", 0),
         )
 
@@ -286,7 +332,8 @@ class Database:
 
     def update_chat(self, chat_id: int, **fields):
         allowed = {"welcome_text", "media_file_id", "media_kind", "buttons",
-                   "emoji", "approve", "title", "chat_type"}
+                   "emoji", "approve", "title", "chat_type",
+                   "custom_bot_token", "custom_bot_name"}
         keys = [k for k in fields if k in allowed]
         if not keys:
             return
@@ -352,7 +399,7 @@ class Database:
 
 # ═══════════════════════════ BOT ════════════════════════════════
 
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatType, ParseMode
 from aiogram.exceptions import (
@@ -382,12 +429,82 @@ from aiogram.types import (
 # ─────────────────────────────────────────────────────────────────────────────
 
 if not BOT_TOKEN:
-    raise SystemExit("❌ BOT_TOKEN is not set! Copy .env.example to .env and fill it.")
+    raise SystemExit(
+        "❌❌ BOT_TOKEN empty hai — isliye bot start nahi hua! ❌❌\n\n"
+        "TOKEN DAALNE KE 2 TAREEKE (koi ek karo):\n\n"
+        "  1️⃣  .env file banao (RECOMMENDED)\n"
+        "      → folder me ek nayi file banao jiska NAAM ho:  .env   (bina kisi extension!)\n"
+        "      → usme ek line likho:  BOT_TOKEN=1234567890:AAH.....tumhara-token\n"
+        "      ⚠️ Windows me dhyan: file ko .env.txt mat naam dena — sirf .env\n"
+        "      ⚠️ .env.example me mat daalo — bot usse padhta hi NAHI hai!\n\n"
+        "  2️⃣  main.py me direct daalo (koi file nahi chahiye)\n"
+        "      → main.py kholo, CONFIG section me line no. ~69 ke paas:\n"
+        "         BOT_TOKEN = os.getenv(\"BOT_TOKEN\", \"\")\n"
+        "      → isko badal kar likho:\n"
+        "         BOT_TOKEN = \"1234567890:AAH.....tumhara-token\"\n\n"
+        "TOKEN KAHAN SE: @BotFather → /mybots → apna bot → API Token\n")
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
+
+
+# ═══════════════════════════ ADMIN GATE (auth) ═══════════════════════════
+# Sirf AUTHORIZED admins hi bot use kar sakte hain. Baaki sabko:
+#   "🚫 You are not authorized to use this bot."
+# Admin banane ka power sirf SUPER-ADMINS (ADMIN_IDS) ke paas hai.
+
+AUTH_MSG = "🚫 You are not authorized to use this bot."
+
+
+def is_super_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
+def is_admin(user_id: int) -> bool:
+    return is_super_admin(user_id) or db.is_admin(user_id)
+
+
+GATE_CACHE: dict = {}          # uid -> (monotonic_time, allowed)
+
+
+def is_authorized(user_id: int) -> bool:
+    """Admin ya chat-owner? (owner ke live chats hain — uske approve buttons
+    bhi gate ke through aate hain)."""
+    now = time.monotonic()
+    cached = GATE_CACHE.get(user_id)
+    if cached is not None and now - cached[0] < 120:
+        return cached[1]
+    allowed = is_admin(user_id) or bool(db.get_chats(user_id))
+    GATE_CACHE[user_id] = (now, allowed)
+    if len(GATE_CACHE) > 2000:
+        GATE_CACHE.clear()
+    return allowed
+
+
+class AdminGate(BaseMiddleware):
+    """Message/callback par lagne wala gate — join-request wale events ko nahi."""
+
+    async def __call__(self, handler, event, data):
+        user = getattr(event, "from_user", None)
+        if user is not None and is_authorized(user.id):
+            return await handler(event, data)
+        # ── unauthorized ──
+        try:
+            if isinstance(event, Message):
+                if (event.text or "").startswith("/start"):
+                    await event.answer(AUTH_MSG)
+                # baaki normal messages silently ignore (spam nahi)
+            elif isinstance(event, CallbackQuery):
+                await event.answer(AUTH_MSG, show_alert=True)
+        except Exception:
+            pass
+        return None
+
+
+router.message.outer_middleware(AdminGate())
+router.callback_query.outer_middleware(AdminGate())
 
 db = Database(DB_PATH)
 
@@ -603,8 +720,53 @@ def render_welcome(row: ChatRow, first: str, last: str, username: str,
                 out.append(seg[2])
                 pos += utf16_len(seg[2])
 
-    entities.sort(key=lambda e: (e.offset, -e.length))
-    return "".join(out), entities
+    # pass 3: split overlapping entities (premium emoji INSIDE bold/italic etc.
+    # causes 'entity overlap' error on Telegram — isliye formatting ko emoji ke
+    # aas-paas tukdo me todna padta hai) + merge adjacent same-type pieces
+    emoji_ranges = [(e.offset, e.offset + e.length)
+                    for e in entities if e.type == "custom_emoji"]
+    cleaned: list[MessageEntity] = []
+    for e in entities:
+        if e.type == "custom_emoji":
+            cleaned.append(e)
+            continue
+        segs = [(e.offset, e.offset + e.length)]
+        for es, ee in emoji_ranges:
+            new_segs = []
+            for s0, s1 in segs:
+                if ee <= s0 or es >= s1:
+                    new_segs.append((s0, s1))
+                    continue
+                if es > s0:
+                    new_segs.append((s0, es))
+                if ee < s1:
+                    new_segs.append((ee, s1))
+            segs = new_segs
+        for s0, s1 in segs:
+            if s1 > s0:
+                cleaned.append(MessageEntity(type=e.type, offset=s0,
+                                             length=s1 - s0))
+
+    merged: list[MessageEntity] = []
+    for e in sorted(cleaned, key=lambda x: (x.offset, -x.length)):
+        if (merged and merged[-1].type == e.type
+                and merged[-1].offset + merged[-1].length == e.offset):
+            merged[-1] = MessageEntity(type=merged[-1].type,
+                                       offset=merged[-1].offset,
+                                       length=merged[-1].length + e.length)
+        else:
+            merged.append(e)
+
+    merged.sort(key=lambda e: (e.offset, -e.length))
+    return "".join(out), merged
+
+
+def render_welcome_text_only(row: ChatRow, first: str, last: str,
+                             username: str, user_id: int,
+                             chat_title: str | None = None) -> str:
+    """Sirf plain text (entities nahi) — buttons/preview display ke liye."""
+    text, _ = render_welcome(row, first, last, username, user_id, chat_title)
+    return text
 
 
 def build_kb(rows: list) -> InlineKeyboardMarkup | None:
@@ -709,37 +871,257 @@ async def notify_owners(text: str, kb: InlineKeyboardMarkup | None = None):
         await notify_user(uid, text, kb)
 
 
-def menu_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
+def menu_kb(uid: int | None = None) -> InlineKeyboardMarkup:
+    rows = [
         [InlineKeyboardButton(text="➕ Add channel / group", callback_data="add")],
         [InlineKeyboardButton(text="📣 Broadcast", callback_data="broadcast"),
          InlineKeyboardButton(text="📊 Users", callback_data="users")],
         [InlineKeyboardButton(text="📋 My chats", callback_data="chats"),
          InlineKeyboardButton(text="❓ Help", callback_data="help")],
-    ])
+    ]
+    if uid is not None and is_super_admin(uid):
+        rows.append([InlineKeyboardButton(text="👑 Admins",
+                                          callback_data="admins")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Welcome composer
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def _send_media(kind: str, chat_id: int, file_id: str,
+# ── custom bots (Channel-Help style: per-chat apna bot) ─────────────────────
+CUSTOM_BOTS: dict = {}          # token -> Bot instance (cache)
+MEDIA_CACHE: dict = {}          # file_id -> bytes (custom bot ke liye download)
+WELCOME_SENT: dict = {}         # (user_id, chat_id) -> monotonic time (dedupe)
+REQ_SEEN: dict = {}             # (user_id, chat_id) -> time — double notification rokne
+CUSTOM_TASKS: dict = {}         # token -> asyncio.Task (custom bot poller)
+
+
+def get_custom_bot(token: str):
+    if token in CUSTOM_BOTS:
+        return CUSTOM_BOTS[token]
+    from aiogram.client.default import DefaultBotProperties
+    b = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    CUSTOM_BOTS[token] = b
+    return b
+
+
+async def _media_bytes(file_id: str):
+    """Main bot se file download karo (custom bot ko file_id samajh nahi aati)."""
+    if file_id in MEDIA_CACHE:
+        return MEDIA_CACHE[file_id]
+    import io
+    f = await bot.get_file(file_id)
+    buf = io.BytesIO()
+    await bot.download_file(f.file_path, destination=buf)
+    data = buf.getvalue()
+    if len(MEDIA_CACHE) > 100:      # simple cache limit
+        MEDIA_CACHE.clear()
+    MEDIA_CACHE[file_id] = data
+    return data
+
+
+def _media_input(kind: str, file_id: str, data: bytes):
+    from aiogram.types import BufferedInputFile
+    ext = {"photo": "jpg", "video": "mp4", "animation": "gif",
+           "document": "bin", "audio": "mp3"}.get(kind, "bin")
+    return BufferedInputFile(file=data, filename=f"welcome.{ext}")
+
+
+async def _send_media(b: Bot, kind: str, chat_id: int, file_id: str,
                       caption: str | None, entities: list | None, kb):
+    """Media bhejo — b=main bot ya custom bot (custom ke liye download+resend)."""
+    if b is bot:                       # main bot: file_id direct
+        media = file_id
+    else:                              # custom bot: bytes dekar bhejna
+        media = _media_input(kind, file_id, await _media_bytes(file_id))
+    kw = dict(caption=caption or None, caption_entities=entities, reply_markup=kb)
     if kind == "photo":
-        await bot.send_photo(chat_id, file_id, caption=caption or None,
-                             caption_entities=entities, reply_markup=kb)
+        await b.send_photo(chat_id, media, **kw)
     elif kind == "video":
-        await bot.send_video(chat_id, file_id, caption=caption or None,
-                             caption_entities=entities, reply_markup=kb)
+        await b.send_video(chat_id, media, **kw)
     elif kind == "animation":
-        await bot.send_animation(chat_id, file_id, caption=caption or None,
-                                 caption_entities=entities, reply_markup=kb)
+        await b.send_animation(chat_id, media, **kw)
     elif kind == "document":
-        await bot.send_document(chat_id, file_id, caption=caption or None,
-                                caption_entities=entities, reply_markup=kb)
+        await b.send_document(chat_id, media, **kw)
     elif kind == "audio":
-        await bot.send_audio(chat_id, file_id, caption=caption or None,
-                             caption_entities=entities, reply_markup=kb)
+        await b.send_audio(chat_id, media, **kw)
+
+
+async def _retry(fn, attempts: int = 3):
+    """
+    Retry wrapper — Telegram flood/retry_after (429) aur transient errors
+    ki wajah se users ka welcome kabhi-kabhi MISS ho jata tha. Ye fix hai.
+    """
+    for i in range(attempts):
+        try:
+            await fn()
+            return True
+        except TelegramRetryAfter as e:
+            wait = float(getattr(e, "retry_after", 3) or 3)
+            wait = min(wait, 25) + 0.5
+            log.warning("Flood (retry_after=%s) — %s sec wait, attempt %d",
+                        wait, int(wait), i + 1)
+            await asyncio.sleep(wait)
+        except (TelegramForbiddenError,) as e:
+            raise e                      # user ne block kiya — retry useless
+        except TelegramBadRequest as e:
+            raise e                      # content error — fallback handle karega
+        except Exception as e:
+            log.warning("Send retry %d: %s", i + 1, e)
+            await asyncio.sleep(1 + i)
+    return False
+
+
+async def _send_via(b: Bot, row: ChatRow, text: str, entities: list,
+                    kb, user_id: int, media_kind: str, file_id: str):
+    """Ek bot se poora welcome (media + text + buttons) bhejo."""
+    if media_kind and file_id:
+        if len(text) <= 1024:
+            await _send_media(b, media_kind, user_id, file_id, text, entities, kb)
+        else:      # caption too long -> media alone, text alag
+            await _send_media(b, media_kind, user_id, file_id, "", None, None)
+            await b.send_message(user_id, text, entities=entities,
+                                 reply_markup=kb)
+    else:
+        await b.send_message(user_id, text, entities=entities, reply_markup=kb)
+
+
+
+
+# ── Custom bot long-pollers (Channel-Help style) ────────────────────────────
+# Agar custom bot us channel me ADMIN hai, to Telegram usko bhi chat_join_request
+# bhejta hai — ye poller usko process karta hai (welcome bhi custom bot se jata hai).
+
+ALLOWED_CB_UPDATES = ["chat_join_request"]
+
+
+async def _req_seen(uid: int, cid: int, ttl: float = 60.0) -> bool:
+    """(user, chat) recently processed? → True (skip). Warna mark karo."""
+    key = (uid, cid)
+    now = time.monotonic()
+    prev = REQ_SEEN.get(key)
+    if prev is not None and now - prev < ttl:
+        return True
+    REQ_SEEN[key] = now
+    if len(REQ_SEEN) > 5000:
+        REQ_SEEN.clear()
+    return False
+
+
+async def _notify_owner_join(row: ChatRow, cjr: ChatJoinRequest, name: str,
+                             username: str, approved: bool):
+    """Owner ko join request ki notification (approve/decline buttons)."""
+    extra = " — auto-approved ✅" if approved else ""
+    text = (f"🙋 <b>{esc(name)}</b>"
+            f"{f' (@{esc(username)})' if username else ''} "
+            f"requested to join\n<b>{esc(row.title)}</b>{extra}")
+    kb = None
+    if row.approve == 0:
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Approve",
+                                 callback_data=f"ajr:{row.chat_id}:{cjr.from_user.id}"),
+            InlineKeyboardButton(text="❌ Decline",
+                                 callback_data=f"djr:{row.chat_id}:{cjr.from_user.id}"),
+        ]])
+    if row.owner_id:
+        await notify_user(row.owner_id, text, kb)
+    else:
+        await notify_owners(text, kb)
+
+
+async def _process_join(row: ChatRow, cjr: ChatJoinRequest, b: Bot):
+    """Common join-request processing (main bot + custom bot dono ke liye)."""
+    user = cjr.from_user
+    first = user.first_name or ""
+    last = user.last_name or ""
+    username = user.username or ""
+    name = f"{first} {last}".strip() or "User"
+
+    if await _req_seen(user.id, row.chat_id):
+        return                                   # doosre bot ne already handle kiya
+
+    # save user (broadcast ke liye)
+    db.upsert_user(row.owner_id, user.id, first, last, username)
+    db.link_user_chat(row.owner_id, user.id, row.chat_id)
+
+    # auto-approve (jis bot ne event receive kiya wahi ADMIN hai — use karo)
+    approved = False
+    if row.approve == 1:
+        try:
+            await b.approve_chat_join_request(row.chat_id, user.id)
+            approved = True
+        except TelegramBadRequest as e:
+            msg = str(e)
+            if "already" not in msg.lower():
+                await notify_user(
+                    row.owner_id,
+                    f"⚠️ Could not approve <b>{esc(name)}</b> in <b>{esc(row.title)}</b>.\n"
+                    f"Error: <code>{esc(msg)}</code>\n"
+                    f"👉 Make sure I have the <b>Invite users</b> admin right.") \
+                    if row.owner_id else await notify_owners(
+                        f"⚠️ Could not approve <b>{esc(name)}</b> in "
+                        f"<b>{esc(row.title)}</b>: {esc(msg)}")
+
+    ok = await send_welcome(row, first, last, username, user.id)
+    if not ok:
+        # welcome fail -> REQ_SEEN hatao taaki doosra bot (custom/main)
+        # wapas try kar sake
+        REQ_SEEN.pop((user.id, row.chat_id), None)
+    await _notify_owner_join(row, cjr, name, username, approved)
+
+
+async def _poll_custom_bot(token: str):
+    """Ek custom bot ke updates lo (sirf chat_join_request)."""
+    cb = get_custom_bot(token)
+    offset = None
+    while True:
+        try:
+            updates = await cb.get_updates(offset=offset, timeout=25,
+                                           allowed_updates=ALLOWED_CB_UPDATES)
+            if not updates:
+                await asyncio.sleep(0.2)   # network hiccup par busy-loop nahi
+                continue
+            for u in updates:
+                offset = u.update_id + 1
+                cjr = getattr(u, "chat_join_request", None)
+                if cjr is None:
+                    continue
+                row = db.get_chat(cjr.chat.id)
+                if row is None or not row.custom_bot_token:
+                    continue
+                if row.custom_bot_token != token:
+                    continue
+                try:
+                    await _process_join(row, cjr, cb)
+                except Exception as e:
+                    log.warning("custom-bot join processing: %s", e)
+        except TelegramConflictError:
+            # koi aur process isi token ko poll kar raha hai (webhook/other host)
+            log.warning("Custom bot token %s... — 409 CONFLICT. Is token par "
+                        "koi aur polling/webhook active hai. Is bot ko main bot "
+                        "se bhi control kar sakte hain (welcome main bot se jayega).",
+                        token[:12])
+            await asyncio.sleep(60)
+        except Exception as e:
+            log.warning("Custom bot poller (%s...): %s", token[:12], e)
+            await asyncio.sleep(5)
+
+
+def sync_custom_pollers():
+    """DB me jo custom tokens hain unke liye poller start/stop karo."""
+    wanted = {}
+    for row in db.get_chats():
+        if row.custom_bot_token:
+            wanted.setdefault(row.custom_bot_token, True)
+    for tok in list(CUSTOM_TASKS):
+        if tok not in wanted:
+            CUSTOM_TASKS.pop(tok).cancel()
+            log.info("Custom bot poller STOPPED (%s...)", tok[:12])
+    for tok in wanted:
+        if tok not in CUSTOM_TASKS or CUSTOM_TASKS[tok].done():
+            CUSTOM_TASKS[tok] = asyncio.create_task(_poll_custom_bot(tok))
+            log.info("Custom bot poller STARTED (%s...)", tok[:12])
 
 
 async def send_welcome(row: ChatRow, first: str, last: str, username: str,
@@ -753,42 +1135,77 @@ async def send_welcome(row: ChatRow, first: str, last: str, username: str,
     kb = build_kb(row.button_rows())
     media_kind, file_id = row.media_kind, row.media_file_id
 
-    try:
-        if media_kind and file_id:
-            if len(text) <= 1024:
-                await _send_media(media_kind, user_id, file_id, text, entities, kb)
-            else:  # caption too long -> media alone, then text with buttons
-                await _send_media(media_kind, user_id, file_id, "", None, None)
-                await bot.send_message(user_id, text, entities=entities,
-                                       reply_markup=kb)
-        else:
-            await bot.send_message(user_id, text, entities=entities,
-                                   reply_markup=kb)
-        return True
-    except (TelegramBadRequest, TelegramForbiddenError) as e1:
-        if "message is too long" in str(e1).lower():
-            await notify_owners(
-                f"⚠️ Welcome for {esc(first)} is too long — shorten it "
-                f"(max {(1024 if media_kind else 4096)} chars).")
-            return False
-        # retry the same content without entities (e.g. stale emoji id)
+    # ── dedupe: custom bot + main bot dono ko yehi join request milti hai ──
+    dkey = (user_id, row.chat_id)
+    now = time.monotonic()
+    last = WELCOME_SENT.get(dkey)
+    if last is not None and now - last < 60:
+        return True                       # doosre bot ne abhi bheja — skip
+    WELCOME_SENT[dkey] = now
+    if len(WELCOME_SENT) > 5000:
+        WELCOME_SENT.clear()
+
+    bots_to_try = [bot]
+    custom = None
+    if row.custom_bot_token:
         try:
-            if media_kind and file_id and len(text) <= 1024:
-                await _send_media(media_kind, user_id, file_id, text, None, kb)
-            elif media_kind and file_id:
-                await _send_media(media_kind, user_id, file_id, "", None, None)
-                await bot.send_message(user_id, text, reply_markup=kb)
-            else:
-                await bot.send_message(user_id, text, reply_markup=kb)
-            return True
-        except Exception as e2:
-            await notify_owners(
-                f"⚠️ Welcome failed for {esc(first)} in {esc(title)}: {e2}")
-            return False
-    except Exception as e:
-        log.exception("send_welcome error")
-        await notify_owners(f"⚠️ Welcome error for {esc(first)}: {e}")
-        return False
+            custom = get_custom_bot(row.custom_bot_token)
+            bots_to_try.insert(0, custom)     # custom bot pehle aayega
+        except Exception:
+            custom = None
+
+    last_err = None
+    for b in bots_to_try:
+        is_custom = (b is not bot)
+        try:
+            ok = await _retry(lambda: _send_via(b, row, text, entities, kb,
+                                                user_id, media_kind, file_id))
+            if ok:
+                WELCOME_SENT[dkey] = time.monotonic()
+                return True
+            last_err = "retries exhausted (flood?)"
+        except TelegramBadRequest as e:
+            last_err = e
+            msg = str(e).lower()
+            if "message is too long" in msg:
+                await notify_owners(
+                    f"⚠️ Welcome for {esc(first)} too long — shorten it "
+                    f"(max {(1024 if media_kind else 4096)} chars).")
+                return False
+            # entity/parse galat (stale emoji id etc.) → bina entities ke resend
+            try:
+                ok2 = await _retry(lambda: _send_via(
+                    b, row, text, None, kb, user_id, media_kind, file_id))
+                if ok2:
+                    WELCOME_SENT[dkey] = time.monotonic()
+                    return True
+            except Exception as e2:
+                last_err = e2
+            # custom bot fail ho to MAIN bot try karo (loop me agla b hai)
+            if is_custom:
+                continue
+            break
+        except TelegramForbiddenError:
+            if is_custom:
+                # custom bot user ke saath conversation start nahi kar sakta
+                # (user ne custom bot ko /start nahi kiya) → main bot try karo
+                last_err = "custom bot forbidden (user ne start nahi kiya)"
+                continue
+            return False                       # user ne MAIN bot block kiya hai
+        except TelegramRetryAfter:
+            last_err = "flood retries exhausted"
+            if is_custom:
+                continue
+        except Exception as e:
+            last_err = e
+            if is_custom:
+                continue                       # custom bot issue → main bot se bhejo
+            break
+
+    await notify_owners(
+        f"⚠️ Welcome user {esc(first)} ({user_id}) ko NAHI gaya"
+        f"{' (custom bot se)' if custom else ''}: {esc(str(last_err)[:120])}")
+    return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -906,6 +1323,7 @@ def panel_text(row: ChatRow) -> str:
         f"🖼 Welcome media: {media}\n"
         f"🔘 Inline buttons:{btn_summary}\n"
         f"⚙️ Auto-approve: {'✅ ON' if row.approve else '⛔ OFF'}\n"
+        f"🤖 Custom bot: {('✅ @' + esc(row.custom_bot_name)) if row.custom_bot_name else '❌ off'}\n"
         f"🆔 <code>{row.chat_id}</code>"
     )
 
@@ -921,6 +1339,8 @@ def panel_kb(row: ChatRow) -> InlineKeyboardMarkup:
             text="✅ Auto-approve ON" if row.approve else "⛔ Auto-approve OFF",
             callback_data=f"auto:{cid}"),
          InlineKeyboardButton(text="🗑 Remove", callback_data=f"del:{cid}")],
+        [InlineKeyboardButton(text="🤖 Custom bot" + (" ✅" if row.custom_bot_token else ""),
+                              callback_data=f"cbot:{cid}")],
         [InlineKeyboardButton(text="🔙 Back to chats", callback_data="chats")],
     ])
 
@@ -962,7 +1382,7 @@ async def cmd_start(message: Message):
         "📣 <b>Broadcast:</b> sirf <b>aapke</b> saved users ko message — "
         "menu me Broadcast dabao."
     )
-    await message.answer(text, reply_markup=menu_kb())
+    await message.answer(text, reply_markup=menu_kb(message.from_user.id))
 
 
 @router.message(Command("add"))
@@ -990,7 +1410,7 @@ async def cmd_chats(message: Message):
 
 @router.message(Command("help"))
 async def cmd_help(message: Message):
-    await message.answer(help_text(), reply_markup=menu_kb(),
+    await message.answer(help_text(), reply_markup=menu_kb(message.from_user.id),
                          disable_web_page_preview=True)
 
 
@@ -1021,6 +1441,95 @@ async def cmd_broadcast(message: Message):
 @router.message(Command("users"))
 async def cmd_users(message: Message):
     await send_users_list(message, message.from_user.id)
+
+
+# ── 👑 ADMIN MANAGEMENT (sirf SUPER-ADMINS) ──────────────────────────────
+async def _resolve_user(message: Message):
+    """Reply wala user / id / @username — return (user_id, name) ya None."""
+    if message.reply_to_message and message.reply_to_message.from_user:
+        u = message.reply_to_message.from_user
+        return u.id, f"{u.first_name} {u.last_name or ''}".strip() or "User"
+    parts = (message.text or "").split()
+    if len(parts) >= 2:
+        arg = parts[1].strip()
+        if arg.lstrip("-").isdigit():
+            return int(arg), arg
+        handle = arg.lstrip("@")
+        if handle:
+            try:
+                u = await bot.get_chat(handle)
+                return u.id, getattr(u, "title", None) or getattr(u, "first_name", None) or handle
+            except Exception:
+                return None, handle
+    return None, ""
+
+
+@router.message(Command("addadmin"))
+async def cmd_addadmin(message: Message):
+    if not is_super_admin(message.from_user.id):
+        await message.answer("⛔ Sirf super-admin hi admin bana sakta hai.")
+        return
+    uid, name = await _resolve_user(message)
+    if not uid:
+        await message.answer(
+            "❌ User nahi mila. Tarike:\n"
+            "• /addadmin <user_id>   ya   /addadmin @username\n"
+            "• Ya kisi user ke message ka REPLY karke /addadmin")
+        return
+    db.add_admin(uid, message.from_user.id)
+    await message.answer(f"✅ <b>{esc(name)}</b> (<code>{uid}</code>) ab bot ka "
+                         f"<b>ADMIN</b> hai — wo bot ko use kar sakta hai.")
+
+
+@router.message(Command("rmadmin"))
+async def cmd_rmadmin(message: Message):
+    if not is_super_admin(message.from_user.id):
+        await message.answer("⛔ Sirf super-admin hi admin hata sakta hai.")
+        return
+    uid, name = await _resolve_user(message)
+    if not uid:
+        await message.answer("❌ User nahi mila. /rmadmin <user_id> ya reply karke.")
+        return
+    if is_super_admin(uid):
+        await message.answer(f"⚠️ <code>{uid}</code> to super-admin hai — nahi hata sakte.")
+        return
+    if db.is_admin(uid):
+        db.remove_admin(uid)
+        await message.answer(f"🗑 <b>{esc(name)}</b> (<code>{uid}</code>) admin se hata diya "
+                             f"— ab wo bot use nahi kar payega.")
+    else:
+        await message.answer(f"ℹ️ <code>{uid}</code> admin list me tha hi nahi.")
+
+
+@router.message(Command("admins"))
+async def cmd_admins(message: Message):
+    if not is_super_admin(message.from_user.id):
+        await message.answer("⛔ Sirf super-admin hi admins dekh sakta hai.")
+        return
+    await send_admins_list(message)
+
+
+async def send_admins_list(reply_to: Message, edit: bool = False):
+    text = "<b>👑 Bot Admins</b>\n\n"
+    text += "• <b>SUPER-ADMIN</b> (hamesha allowed):\n"
+    for uid in ADMIN_IDS:
+        text += f"   └ <code>{uid}</code>\n"
+    admins = db.get_admins()
+    text += f"\n• <b>Admins added by you</b> ({len(admins)}):\n"
+    if not admins:
+        text += "   └ (koi nahi — /addadmin se banao)\n"
+    for a in admins:
+        text += f"   └ <code>{a.get('user_id')}</code>  (by {esc(a.get('added_by', ''))})\n"
+    text += "\n➕ <code>/addadmin</code>  🗑 <code>/rmadmin</code>  (reply karke ya id se)"
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🔙 Main menu", callback_data="home")]])
+    if edit:
+        try:
+            await reply_to.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
+        except TelegramBadRequest:
+            await reply_to.answer(text, reply_markup=kb, disable_web_page_preview=True)
+    else:
+        await reply_to.answer(text, reply_markup=kb, disable_web_page_preview=True)
 
 
 @router.message(Command("backup"))
@@ -1130,7 +1639,18 @@ def help_text() -> str:
         "• /users — saved users ki list\n"
         "• /stopbroadcast — chalu broadcast rokna\n\n"
         "💡 Agar kisi chat ke liye <b>auto-approve</b> wapas chahiye to us chat "
-        "ke panel me <b>Auto-approve ON</b> dabao."
+        "ke panel me <b>Auto-approve ON</b> dabao.\n\n"
+        "<b>🤖 Custom bot (per-chat)</b>\n"
+        "• Chat panel me <b>Custom bot</b> button → @BotFather ka naya bot token "
+        "bhejo\n"
+        "• Welcome us custom bot se jayega (Channel Help style)\n"
+        "• Best: custom bot ko channel me bhi <b>admin</b> banao + <b>Invite users</b> "
+        "right do\n\n"
+        "👑 <b>Admin access</b>\n"
+        "• Bot sirf <b>authorized</b> users use kar sakte hain\n"
+        "• Super-admin naye admins bana sakta hai: <code>/addadmin</code> "
+        "(reply karke ya id se), hatane ke liye <code>/rmadmin</code>\n"
+        "• Chat owners hamesha allowed hain (unke approve buttons chahiye)"
     )
 
 
@@ -1211,6 +1731,52 @@ async def on_private_message(message: Message):
         db.update_chat(chat_id, buttons=json.dumps(rows))
         row = db.get_chat(chat_id)
         await message.answer(f"✅ Saved {sum(len(r) for r in rows)} button(s).")
+        await edit_panel(message, row)
+        return
+
+    # ── waiting for custom-bot token ────────────────────────────────────────
+    if flow == "cbt":
+        chat_id = int(payload)
+        raw = (message.text or "").strip()
+        # user ke message me kahin token ho to nikaal lo
+        m = re.search(r"[0-9]{6,12}:[A-Za-z0-9_\-]{30,}", raw)
+        token = m.group(0) if m else raw
+        if not re.fullmatch(r"[0-9]{6,12}:[A-Za-z0-9_\-]{30,}", token):
+            await message.answer(
+                "❌ Ye sahi token nahi lag raha.\n\n"
+                "@BotFather → /newbot → token copy karke bhejo.\n"
+                "Format: <code>1234567890:AAH.....</code>\n"
+                "(sirf /cancel se band kar sakte ho)")
+            STASH[message.chat.id] = state
+            return
+        if token == BOT_TOKEN:
+            await message.answer(
+                "⚠️ Ye to main bot ka hi token hai! Custom bot ke liye "
+                "@BotFather se <b>naya bot</b> banao ({username}).")
+            STASH[message.chat.id] = state
+            return
+        # validate + get name
+        try:
+            tb = get_custom_bot(token)
+            me = await tb.get_me()
+        except Exception as e:
+            await message.answer(
+                f"❌ Token <b>invalid</b> hai: {esc(str(e)[:120])}\n\n"
+                "• Copy-paste me koi space/quote nahi hona chahiye\n"
+                "• @BotFather se fresh token lo\n"
+                "• Dobara bhej do")
+            STASH[message.chat.id] = state
+            return
+        db.update_chat(chat_id, custom_bot_token=token,
+                       custom_bot_name=me.username or me.first_name or "")
+        row = db.get_chat(chat_id)
+        sym = me.username or ""
+        sync_custom_pollers()
+        await message.answer(
+            f"✅ Custom bot <b>@{esc(sym)}</b> set ho gaya for "
+            f"<b>{esc(row.title)}</b>!\n\n"
+            "💡 Best result ke liye custom bot ko channel me <b>admin</b> banao "
+            "(<b>Invite users</b> right do) — phir welcome 100% usi se jayega.")
         await edit_panel(message, row)
         return
 
@@ -1363,40 +1929,9 @@ async def on_join_request(update: ChatJoinRequest):
     db.upsert_user(owner_id, user.id, first, last, username)
     db.link_user_chat(owner_id, user.id, update.chat.id)
 
-    # 2) welcome in PM — WITHOUT approving (default).
-    approved = False
-    if row.approve == 1:
-        try:
-            await bot.approve_chat_join_request(update.chat.id, user.id)
-            approved = True
-        except TelegramBadRequest as e:
-            msg = str(e)
-            if "already" not in msg.lower():  # USER_ALREADY_PARTICIPANT is fine
-                await notify_user(
-                    owner_id,
-                    f"⚠️ Could not approve <b>{esc(name)}</b> in <b>{esc(row.title)}</b>.\n"
-                    f"Error: <code>{esc(msg)}</code>\n"
-                    "👉 Make sure I have the <b>Invite users</b> admin right.") if owner_id \
-                    else await notify_owners(f"⚠️ Could not approve <b>{esc(name)}</b> in "
-                                             f"<b>{esc(row.title)}</b>: {esc(msg)}")
-
-    await send_welcome(row, first, last, username, user.id)
-
-    # 3) notify the chat OWNER (approve/decline buttons)
-    extra = " — auto-approved ✅" if approved else ""
-    text = (f"🙋 <b>{esc(name)}</b>"
-            f"{f' (@{esc(username)})' if username else ''} "
-            f"requested to join\n<b>{esc(row.title)}</b>{extra}")
-    kb = None
-    if row.approve == 0:
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="✅ Approve", callback_data=f"ajr:{update.chat.id}:{user.id}"),
-            InlineKeyboardButton(text="❌ Decline", callback_data=f"djr:{update.chat.id}:{user.id}"),
-        ]])
-    if owner_id:
-        await notify_user(owner_id, text, kb)
-    else:
-        await notify_owners(text, kb)
+    # 2/3) dedupe + welcome + owner-notification (custom bot poller ke saath shared)
+    #      (_process_join apne andar _req_seen check karta hai)
+    await _process_join(row, update, bot)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1410,8 +1945,16 @@ async def bot_added(update: ChatMemberUpdated):
         return
     title = chat.title or "Unknown"
     # Jisne bot add kiya wahi chat ka owner (multi-user)
+    # ⚠️ ADMIN GATE: unauthorized user chat CLAIM nahi kar sakta
     adder = update.from_user
-    owner_id = adder.id if adder else 0
+    owner_id = 0
+    if adder is not None and is_authorized(adder.id):
+        owner_id = adder.id
+    elif adder is not None and not is_authorized(adder.id):
+        try:
+            await bot.send_message(adder.id, AUTH_MSG)
+        except Exception:
+            pass
     row = db.get_chat(chat.id)
     if row is None:
         row = db.add_chat(chat.id, chat.type, title, owner_id=owner_id)
@@ -1478,7 +2021,7 @@ async def on_callback(query: CallbackQuery):
 
     if data == "home":
         await query.answer()
-        await msg.edit_text("<b>👋 Main menu</b>", reply_markup=menu_kb())
+        await msg.edit_text("<b>👋 Main menu</b>", reply_markup=menu_kb(uid))
         return
 
     if data == "add":
@@ -1503,6 +2046,14 @@ async def on_callback(query: CallbackQuery):
     if data == "users":
         await query.answer()
         await send_users_list(msg, uid)
+        return
+
+    if data == "admins":
+        if not is_super_admin(uid):
+            await query.answer("⛔ Sirf super-admin.", show_alert=True)
+            return
+        await query.answer()
+        await send_admins_list(msg, edit=True)
         return
 
     if data == "broadcast":
@@ -1555,12 +2106,21 @@ async def on_callback(query: CallbackQuery):
         if _row is not None and _row.owner_id and _row.owner_id != uid:
             await query.answer("⛔ Ye chat aapki nahi hai.", show_alert=True)
             return
+        # custom bot set hai to wahan se approve/decline karo (wo admin hai; main
+        # bot nahi ho sakta agar sirf custom bot channel me hai)
+        which = _row if _row is not None else None
+        b = bot
+        if which is not None and which.custom_bot_token:
+            try:
+                b = get_custom_bot(which.custom_bot_token)
+            except Exception:
+                b = bot
         try:
             if action == "ajr":
-                await bot.approve_chat_join_request(cid, uid)
+                await b.approve_chat_join_request(cid, uid)
                 text = "✅ Approved — user can now join."
             else:
-                await bot.decline_chat_join_request(cid, uid)
+                await b.decline_chat_join_request(cid, uid)
                 text = "❌ Declined."
         except TelegramBadRequest as e:
             text = f"⚠️ {e}"
@@ -1579,6 +2139,56 @@ async def on_callback(query: CallbackQuery):
             return
         await query.answer()
         await edit_panel(msg, row)
+        return
+
+    # ── custom bot (per-chat) ───────────────────────────────────────────────
+    if data.startswith("cbot:"):
+        row = owned(int(data.split(":", 1)[1]))
+        if row is None:
+            await query.answer("⛔ Ye chat aapki nahi hai ya delete ho gayi.", show_alert=True)
+            return
+        if row.custom_bot_token:
+            STASH[query.from_user.id] = ("cbt", str(row.chat_id))
+            await query.answer()
+            await msg.edit_text(
+                f"🤖 <b>Custom bot</b> — {esc(row.title)}\n\n"
+                f"✅ Abhi set hai: <b>@{esc(row.custom_bot_name)}</b>\n\n"
+                "Is chat ki join requests par welcome <b>custom bot se</b> jayega.\n"
+                "• Naya token set karne ke liye bhej do (saath me old replace ho jayega)\n"
+                "• Token format: <code>1234567890:AAH....</code>\n"
+                "• Custom bot ko channel me <b>admin</b> banao + <b>Invite users</b> right do — "
+                "tab wo khud requests receive karega (best).\n"
+                "• Nahi bhi banao to bhi welcome custom bot se jayega (jab tak wo user "
+                "ko start kar sakta hai) — nahi to main bot bhej dega.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🗑 Remove custom bot",
+                                          callback_data=f"cbrm:{row.chat_id}")],
+                    [InlineKeyboardButton(text="🔙 Back", callback_data=f"chat:{row.chat_id}")]]))
+            return
+        STASH[query.from_user.id] = ("cbt", str(row.chat_id))
+        await query.answer()
+        await msg.edit_text(
+            f"🤖 <b>Custom bot</b> — {esc(row.title)}\n\n"
+            "Apna custom bot lagana hai to @BotFather se bot banao aur uska "
+            "<b>token</b> yahan bhej do.\n\n"
+            "<b>Kyon?</b> Is chat ke join-request users ko welcome <b>custom bot se</b> "
+            "jayega (Channel Help style) — aapka apna brand.\n\n"
+            "• Token format: <code>1234567890:AAH....</code>\n"
+            "• Token aapke alawa kisi ko nahi dikhta (sirf is chat ke saath save hota hai)\n"
+            "• Cancel: /cancel",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🔙 Back", callback_data=f"chat:{row.chat_id}")]]))
+        return
+
+    if data.startswith("cbrm:"):
+        row = owned(int(data.split(":", 1)[1]))
+        if row is None:
+            await query.answer("⛔ Ye chat aapki nahi hai.", show_alert=True)
+            return
+        db.update_chat(row.chat_id, custom_bot_token="", custom_bot_name="")
+        sync_custom_pollers()
+        await query.answer("Custom bot hataya gaya.")
+        await edit_panel(msg, db.get_chat(row.chat_id))
         return
 
     if data.startswith("auto:"):
@@ -1756,23 +2366,53 @@ async def main():
     )
     global ME_ID, BOT_USERNAME
 
-    # Purane single-user DB me data tha to wo ADMIN_IDS[0] ke naam migrate hota hai
-    db.connect(legacy_owner=ADMIN_IDS[0] if ADMIN_IDS else 0)
+    # ── 0) TOKEN CHECK ──
+    # Agar pehle isi token pe kisi webhook/host ka bot chala tha, to polling
+    # kabhi update nahi leti — bot "respond nahi karta". Webhook hatao:
+    try:
+        await bot.delete_webhook(drop_pending_updates=False)
+        log.info("Webhook check OK (conflict nahi)")
+    except Exception as e:
+        log.warning("delete_webhook: %s", e)
 
-    # ── AUTO-BACKUP (VPS restart / crash / delete se bachav) ──
-    # 24h me ek baar (interval config me) + har bot start pe check
+    # ── 1) MONGODB ──
+    try:
+        db.connect(legacy_owner=ADMIN_IDS[0] if ADMIN_IDS else 0)
+    except SystemExit:
+        raise
+
+    # ── 2) TOKEN VALID? (getMe) ──
+    try:
+        me = await bot.get_me()
+    except Exception as e:
+        raise SystemExit(
+            "❌❌ BOT_TOKEN galat lag raha hai! ❌❌\n\n"
+            f"   Telegram error: {e}\n\n"
+            "   • Token me extra space/quote nahi hona chahiye\n"
+            "   • @BotFather → /mybots → apna bot → API Token → dobara copy\n"
+            "   • BotFather me bot 'disabled' na ho (us par unblock karo)\n"
+            "   • .env me line aisi ho: BOT_TOKEN=1234567890:AAHxxxx (naam = BOT_TOKEN)")
+    ME_ID = me.id
+    BOT_USERNAME = me.username or ""
+    log.info("✅ Bot @%s verify ho gaya (token sahi hai). SUPER-ADMINS: %s",
+             BOT_USERNAME, ADMIN_IDS)
+
+    # ── 2.5) CUSTOM BOT POLLERS (per-chat bots) ──
+    try:
+        sync_custom_pollers()
+    except Exception as e:
+        log.warning("sync_custom_pollers: %s", e)
+
+    # ── 3) AUTO-BACKUP ──
     try:
         bpath, bcreated = auto_backup()
         if bpath:
-            log.info("Backup %s: %s", "CREATED" if bcreated else "up-to-date, skipped", bpath)
+            log.info("Backup %s: %s",
+                     "CREATED" if bcreated else "up-to-date, skipped", bpath)
     except Exception as e:
         log.warning("Startup backup failed: %s", e)
 
-    me = await bot.get_me()
-    ME_ID = me.id
-    BOT_USERNAME = me.username or ""
-    log.info("Bot @%s started (MULTI-USER). Super-admins: %s", BOT_USERNAME, ADMIN_IDS)
-
+    # ── 4) BOT COMMANDS ──
     await bot.set_my_commands([
         BotCommand(command="start", description="Main menu"),
         BotCommand(command="add", description="Add a channel / group"),
@@ -1795,6 +2435,22 @@ async def main():
         except Exception:
             pass
 
+    # ── ready summary ──
+    try:
+        n_chats = len(db.get_chats())
+        n_users = db.users.count_documents({})
+    except Exception:
+        n_chats = n_users = "?"
+    log.info("──────────────────────────────────────────────")
+    log.info("✅ Bot @%s CHALU HO GAYA — sab kuch ready!", BOT_USERNAME)
+    log.info("   📚 Chats: %s  |  👥 Saved users: %s", n_chats, n_users)
+    log.info("   👉 Ab Telegram me @%s ko /start karo.", BOT_USERNAME)
+    log.info("   ❌ Agar /start pe reply NAHI aata to:")
+    log.info("      • Token sahi hai? (upar verify ho chuka hai)")
+    log.info("      • Bot Father me bot 'disabled' to nahi?")
+    log.info("      • Do jagah (dusra PC/VPS) par same bot nahi chala rahe?")
+    log.info("      • Isi token pe dusre host (pythonanywhere etc.) se webhook set to nahi?")
+    log.info("──────────────────────────────────────────────")
     log.info("Polling started — waiting for join requests…")
     await dp.start_polling(bot, allowed_updates=[
         "message", "callback_query", "chat_join_request", "my_chat_member",
@@ -1812,5 +2468,10 @@ if __name__ == "__main__":
     else:
         try:
             asyncio.run(main())
-        except (KeyboardInterrupt, SystemExit):
+        except KeyboardInterrupt:
             log.info("Bot stopped.")
+        except SystemExit as e:
+            # hamare Hinglish error messages ko properly dikhao (swallow mat karo)
+            if str(e):
+                print(str(e))
+            sys.exit(1)

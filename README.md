@@ -38,6 +38,9 @@ broadcast** se apne sabhi users ko ek saath message bhej sakta hai.
 | 📨 Owner log | Har request par aapko PM: naam, username, channel — ✅ Approve / ❌ Decline buttons ke saath |
 | 🧪 Preview | Preview button se khud dekho user ko kya milega |
 | 🚫 /stopbroadcast | Chalu broadcast beeche me rok sakte ho |
+| 👑 **Admin access gate** | Sirf authorized users bot use karte hain — baaki ko `/start` par `🚫 You are not authorized` |
+| 🤖 **Per-chat custom bot** | Har channel/group ke liye apna bot (Channel Help style) — welcome usi se jata hai |
+| 🔁 **Reliable welcome DM** | Flood (429) par auto-retry, custom bot fail → main bot fallback, double-send dedupe |
 
 ---
 
@@ -126,6 +129,9 @@ Ab telegram me apne bot ko `/start` karo.
 | `/broadcast` | 📣 **Sabhi saved users ko message bhejo** |
 | `/users` | 📊 Saved users ki list |
 | `/stopbroadcast` | ⏹ Chalu broadcast rok do |
+| `/addadmin` | 👑 **SUPER-ADMIN:** naya admin banao (reply karke ya user-id/@username dekar) |
+| `/rmadmin` | 👑 **SUPER-ADMIN:** admin hatao |
+| `/admins` | 👑 **SUPER-ADMIN:** admins ki list |
 | `/help` | Poori guide |
 | `/cancel` | Koi bhi process cancel |
 
@@ -149,8 +155,58 @@ Bas! Bot chat ko save karke **settings panel** khol dega.
   message karta hai aur aap ✅/❌ buttons se approve karte ho. Agar kisi chat
   ke liye turant auto-approve chahiye to ise ON karo.
 - **🗑 Remove** — chat delete
+- **🤖 Custom bot** — is chat ke liye apna bot token set karo
+  (welcome us custom bot se jayega — Channel Help style)
+
 
 ---
+
+## 👑 Admin access gate (sirf authorized users)
+
+**Kya hota hai:** Ab bot me sirf **authorized** users hi `start`/commands/
+buttons use kar sakte hain. Koi aur user `/start` kare to usse sirf milega:
+
+> 🚫 You are not authorized to use this bot.
+
+**Kaun authorized hai?**
+1. **SUPER-ADMINS** — `.env` me `ADMIN_IDS` wale (control: aur kuch nahi chahiye)
+2. **Admins** — super-admin jo `/addadmin` se banata hai (he is one of `ADMIN_IDS`)
+
+**Commands (sirf super-admin):**
+- `/addadmin` — kisi user ko admin banao:
+  - uski koi message par **reply** karke `/addadmin`, ya
+  - `/addadmin <user_id>`, ya `/addadmin @username`
+- `/rmadmin` — admin hatao (wo aur bot use nahi kar payega)
+- `/admins` — admins ki list
+
+**Agar ADMIN_IDS khali hai** to gate OFF hai — koi bhi bot use kar sakta hai
+(purana multi-user behavior). **Chat owners hamesha allowed** rehte hain
+(unke channels ke approve buttons kabhi band nahi hote).
+
+## 🤖 Per-chat custom bot (Channel Help style)
+
+Har channel/group ke liye **apna bot** lagao — us chat ki join requests par
+welcome **aapke custom bot se** jayega.
+
+**Kyun?** Branding + reliability — agar main bot par koi problem ho to bhi
+aapke users ko welcome custom bot se milta hai.
+
+**Kaise set karein:**
+1. @BotFather se ek **naya bot** banao (`/newbot`) → token copy karo
+2. Bot me: `/chats` → apni chat kholo → **🤖 Custom bot** button
+3. Token paste karo — bas! Welcome ab custom bot se jata hai
+4. (Best result ke liye) custom bot ko bhi us channel me **admin** banao +
+   **Invite users** right do — tab custom bot khud join requests receive karta hai
+   aur 100% usi se welcome jata hai
+
+**Safety:** Token sirf us chat ke saath MongoDB me save hota hai —
+kisi ko display nahi hota. Remove ke liye wahi panel me **Remove custom bot**.
+
+**Reliability detail:** agar custom bot user ko message nahi bhej pa raha
+(user ne usko start nahi kiya ya bot admin nahi hai), to bot **automatically
+main bot se** welcome bhej deta hai — user kabhi khali nahi jata. Flood (429)
+par 3 retries + wait bhi hai. Custom + main dono ko same request milti hai
+to **double message nahi** jata (dedupe).
 
 ## 📣 Broadcast — sabhi users ko message (naya!)
 
